@@ -14,7 +14,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,6 +27,12 @@ type Client struct {
 	apiKey     string
 	baseURL    string
 	httpClient *http.Client
+	minGap     time.Duration
+
+	gapMu     sync.Mutex
+	lastReqAt time.Time
+	rlMu      sync.Mutex
+	rlState   RateLimitState
 }
 
 // Option customises a Client.
@@ -57,6 +65,7 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 		apiKey:     apiKey,
 		baseURL:    defaultBaseURL,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
+		minGap:     0, // no throttle by default; updates after rate-limit headers arrive
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -78,6 +87,11 @@ func (e *APIError) Error() string {
 // do issues an authenticated JSON request and decodes the response into out
 // (which may be nil to discard the body).
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	c.waitForGap(ctx)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	var reader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -108,6 +122,25 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return fmt.Errorf("elevenlabs: read response: %w", err)
 	}
 
+	c.updateRateLimit(resp.Header)
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		wait := parseRetryAfter(resp.Header.Get("Retry-After"), 60*time.Second)
+		c.rlMu.Lock()
+		c.rlState.Remaining = 0
+		c.rlState.RetryAfter = wait
+		if c.rlState.Reset.IsZero() || time.Until(c.rlState.Reset) < wait {
+			c.rlState.Reset = time.Now().Add(wait)
+		}
+		c.rlMu.Unlock()
+		c.gapMu.Lock()
+		if earliest := time.Now().Add(wait); c.lastReqAt.Before(earliest) {
+			c.lastReqAt = earliest
+		}
+		c.gapMu.Unlock()
+		return &APIError{StatusCode: resp.StatusCode, Body: string(raw)}
+	}
+
 	if resp.StatusCode >= 400 {
 		return &APIError{StatusCode: resp.StatusCode, Body: string(raw)}
 	}
@@ -119,4 +152,149 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return fmt.Errorf("elevenlabs: decode response: %w", err)
 	}
 	return nil
+}
+
+// RateLimitState captures rate-limit information from the most recently observed
+// response headers. All fields are zero-valued until a response with rate-limit
+// headers is received.
+type RateLimitState struct {
+	Limit      int           `json:"limit"`       // max requests per window (0 = not reported)
+	Remaining  int           `json:"remaining"`   // requests left in the current window
+	Reset      time.Time     `json:"reset"`       // when the window resets (UTC)
+	RetryAfter time.Duration `json:"retry_after"` // set to Retry-After duration after a 429
+}
+
+// IsLimited reports whether the current state indicates requests are blocked.
+func (r RateLimitState) IsLimited() bool {
+	if !r.Reset.IsZero() && r.Remaining == 0 && time.Now().Before(r.Reset) {
+		return true
+	}
+	return r.RetryAfter > 0
+}
+
+// ResetIn returns how long until the rate-limit window resets.
+// Returns 0 if Reset is in the past or not set.
+func (r RateLimitState) ResetIn() time.Duration {
+	if r.Reset.IsZero() {
+		return 0
+	}
+	if d := time.Until(r.Reset); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// RateLimit returns a snapshot of the most recently observed rate-limit state.
+func (c *Client) RateLimit() RateLimitState {
+	c.rlMu.Lock()
+	defer c.rlMu.Unlock()
+	return c.rlState
+}
+
+func (c *Client) updateRateLimit(h http.Header) {
+	c.rlMu.Lock()
+	defer c.rlMu.Unlock()
+	// Try standard headers first, then ElevenLabs character-quota headers as fallback.
+	for _, suffix := range []string{"Limit", "Limit-Character"} {
+		if v := rlHeader(h, suffix); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				c.rlState.Limit = n
+			}
+			break
+		}
+	}
+	for _, suffix := range []string{"Remaining", "Remaining-Character"} {
+		if v := rlHeader(h, suffix); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				c.rlState.Remaining = n
+			}
+			break
+		}
+	}
+	for _, suffix := range []string{"Reset", "Reset-Character"} {
+		if v := rlHeader(h, suffix); v != "" {
+			if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
+				if ts > 1_000_000_000 {
+					c.rlState.Reset = time.Unix(ts, 0)
+				} else {
+					c.rlState.Reset = time.Now().Add(time.Duration(ts) * time.Second)
+				}
+			}
+			break
+		}
+	}
+}
+
+func rlHeader(h http.Header, suffix string) string {
+	for _, p := range []string{"X-RateLimit-", "X-Rate-Limit-", "X-Ratelimit-", "RateLimit-"} {
+		if v := strings.TrimSpace(h.Get(p + suffix)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func (c *Client) adaptiveGap() time.Duration {
+	c.rlMu.Lock()
+	rs := c.rlState
+	c.rlMu.Unlock()
+
+	if rs.Remaining == 0 && !rs.Reset.IsZero() {
+		if d := time.Until(rs.Reset); d > 0 {
+			return d + 50*time.Millisecond
+		}
+	}
+	if rs.Remaining > 0 && !rs.Reset.IsZero() {
+		if d := time.Until(rs.Reset); d > 0 {
+			spread := d / time.Duration(float64(rs.Remaining)*0.9)
+			if spread > c.minGap {
+				return spread
+			}
+		}
+	}
+	return c.minGap
+}
+
+func (c *Client) waitForGap(ctx context.Context) {
+	gap := c.adaptiveGap()
+	c.gapMu.Lock()
+	now := time.Now()
+	next := c.lastReqAt.Add(gap)
+	if now.After(next) {
+		next = now
+	}
+	c.lastReqAt = next
+	c.gapMu.Unlock()
+
+	if wait := time.Until(next); wait > 0 {
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+	}
+	c.rlMu.Lock()
+	c.rlState.RetryAfter = 0
+	c.rlMu.Unlock()
+}
+
+func parseRetryAfter(val string, fallback time.Duration) time.Duration {
+	if val == "" {
+		return fallback
+	}
+	trimmed := strings.TrimSpace(val)
+	if n, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		if n > 1_000_000_000 {
+			if d := time.Until(time.Unix(n, 0)); d > 0 {
+				return d
+			}
+			return fallback
+		}
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(trimmed); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return fallback
 }
