@@ -102,6 +102,27 @@ client, _ := elevenlabs.New(
 )
 ```
 
+## MCP support
+
+This package ships an [MCP](https://modelcontextprotocol.io/) tool surface in `./mcp` for use with [`teslashibe/mcptool`](https://github.com/teslashibe/mcptool)-compatible hosts (e.g. [`teslashibe/agent-setup`](https://github.com/teslashibe/agent-setup)). 11 tools cover the full client API: agent CRUD (create / get / update / delete), conversations (list, get, signed URL), Twilio phone numbers (import / list / assign agent), and outbound calling.
+
+```go
+import (
+    "github.com/teslashibe/mcptool"
+    elevenlabs "github.com/teslashibe/elevenlabs-go"
+    elmcp "github.com/teslashibe/elevenlabs-go/mcp"
+)
+
+client, _ := elevenlabs.New("xi-api-key-...")
+provider := elmcp.Provider{}
+for _, tool := range provider.Tools() {
+    // register tool with your MCP server, passing client as the
+    // opaque client argument when invoking
+}
+```
+
+A coverage test in `mcp/mcp_test.go` fails if a new exported method is added to `*Client` without either being wrapped by an MCP tool or being added to `mcp.Excluded` with a reason — keeping the MCP surface in lockstep with the package API is enforced by CI rather than convention.
+
 ## License
 
 MIT
